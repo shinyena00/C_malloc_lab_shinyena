@@ -42,13 +42,14 @@ team_t team = {
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
-#define PACK(size, alloc) ((size) | (alloc))
+#define PACK(size, p_inuse, alloc) ((size) | ((p_inuse) << 1) | (alloc)) // prev_inuse 블록 추가 
 
 #define GET(p) (*(unsigned int *)(p)) // int로 읽기 
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
 
 #define GET_SIZE(p) (GET(p) & ~0x7)
 #define GET_ALLOC(p) (GET(p) & 0x1)
+#define GET_P_INUSE(p) ((GET(p) & 0x2) >> 1)
 
 #define HDRP(bp) ((char *)(bp) - WSIZE)
 #define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
@@ -59,13 +60,12 @@ team_t team = {
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7) // 정렬의 배수로 올림 (~0x7로 지움 구현)
 
-#define SIZE_T_SIZE (ALIGN(sizeof(size_t))) // size_t를 올림 -> 여기서는 8바이트 즉, 푸터와 헤더 8바이트를 더해서 배수 구함
 
 static void *extend_heap(size_t words); // 함수 프로토타입 선언 
 static void *coalesce(void *bp);
 static void *find_fit(size_t asize);
-static void place(void *bp, size_t asize);
-static void *split_block(void *bp, size_t size);
+static void place(void *bp, size_t size);
+static void change_prev(void *bp, size_t prev_alloc);
 
 static char *heap_listp; // 전역변수로 포인터 선언 
 static char* current; // next_fit 를 위한 전연변수 
@@ -82,10 +82,10 @@ int mm_init(void)
     }
 
     PUT(heap_listp, 0);
-    PUT(heap_listp + WSIZE, PACK(DSIZE, 1)); // Prologue header
-    PUT(heap_listp + 2 * WSIZE, PACK(DSIZE, 1)); // Prologue footer
-    PUT(heap_listp + 3 * WSIZE, PACK(0, 1)); //  Epilogue header 
-    heap_listp += 4 *WSIZE; // 첫 청크부터 시작하는 작은 최적화(처음에는 heap의 끝을 가르킴 )
+    PUT(heap_listp + WSIZE, PACK(DSIZE, 1, 1)); // Prologue header
+    PUT(heap_listp + 2 * WSIZE, PACK(DSIZE, 1, 1)); // Prologue footer
+    PUT(heap_listp + 3 * WSIZE, PACK(0, 1, 1)); //  Epilogue header -> 처음은 헤더의 alloc과 같아야하니까 1로 시작해야함 
+    heap_listp += 4 * WSIZE; // 첫 청크부터 시작하는 작은 최적화(처음에는 heap의 끝을 가르킴 )
     current = heap_listp - 2 * WSIZE; // next_fit 변수 초기화
 
     if(extend_heap(CHUNKSIZE / WSIZE) == NULL){ // heap 공간 확보 
@@ -110,9 +110,11 @@ static void *extend_heap(size_t words)
         return NULL;
     }
 
-    PUT((char *)bp - WSIZE, PACK(size, 0)); // new chunk header
-    PUT(FTRP(bp), PACK(size, 0));     // newe chunk footer
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(0,1)); // epilogue
+    size_t isprev = GET_P_INUSE(HDRP(bp));
+
+    PUT((char *)bp - WSIZE, PACK(size, isprev, 0)); // new chunk header
+    PUT(FTRP(bp), PACK(size, isprev, 0));     // newe chunk footer
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 0, 1)); // epilogue
 
     return coalesce(bp);
 
@@ -135,11 +137,10 @@ void *mm_malloc(size_t size)
         size = 2 * DSIZE;
     }
     else{
-        size = ALIGN(size + SIZE_T_SIZE); // 올림 
+        size = ALIGN(size + WSIZE); // 올림 + 헤더
     }
 
     if((bp = find_fit(size)) != NULL){
-        bp = split_block(bp, size);
         place(bp, size);
         return bp;
     }
@@ -149,7 +150,6 @@ void *mm_malloc(size_t size)
             return NULL;
         }
 
-        bp = split_block(bp, size);
         place(bp, size);
         return bp;
     }
@@ -192,30 +192,56 @@ static void *find_fit(size_t asize)
 }
 
 
-static void place(void *bp, size_t asize)
-{
-    if(GET_SIZE(HDRP(bp)) > asize){
-        asize = GET_SIZE(HDRP(bp));
-    }
-    PUT(HDRP(bp), PACK(asize, 1));
-    PUT(FTRP(bp), PACK(asize, 1));
+// static void place(void *bp, size_t asize)
+// {
+//     if(GET_SIZE(HDRP(bp)) > asize){
+//         asize = GET_SIZE(HDRP(bp));
+//     }
+//     PUT(HDRP(bp), PACK(asize, GET_P_INUSE(HDRP(bp)), 1));
 
+// }
+
+/* 푸터는 지금은 안 건드려도 됨 
+static void change_prev(char *bp, size_t prev){
+    size_t size = GET_SIZE(HDRP(bp));
+    size_t alloc = GET_ALLOC(HDRP(bp));
+
+    PUT(HDRP(bp), PACK(size, prev, alloc));
+    
+    if(alloc == 1){
+        return;
+    }
+
+    PUT(FTRP(bp), PACK(size, prev, alloc));
+}
+*/
+
+static void change_prev(void *bp, size_t prev_alloc){
+    char *target = HDRP(bp);
+    if(prev_alloc){
+        PUT(target, GET(target) | 0x2); // prev_inuse 키기
+    }
+    else{
+        PUT(target, GET(target) & ~0x2); // 끄기
+    }
 }
 
-static void *split_block(void *bp, size_t size){
+static void place(void *bp, size_t size){
+
 
     size_t total = GET_SIZE(HDRP(bp));
+    size_t prev = GET_P_INUSE(HDRP(bp));
 
-    if(total - size < 2 * DSIZE){
-        return bp; // 분할 햇다고 생각햇을 때 total-size 가 16바이트보다 작으면 그냥 return -> 이 조건에서 total == size인 경우도 잡아짐 
+    if(total - size < 3 * WSIZE){
+        PUT(HDRP(bp), PACK(total, prev, 1));
+        change_prev(NEXT_BLKP(bp), 1);
+        return; // 분할 햇다고 생각햇을 때 total-size 가 12바이트보다 작으면 그냥 return -> 이 조건에서 total == size인 경우도 잡아짐 
     }
 
-    PUT(HDRP(bp), PACK(size, 0));
-    PUT(FTRP(bp), PACK(size, 0));
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(total-size, 0));
-    PUT(FTRP(NEXT_BLKP(bp)), PACK(total-size, 0));
+    PUT(HDRP(bp), PACK(size, prev, 1));
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(total-size, 1,  0));
+    PUT(FTRP(NEXT_BLKP(bp)), PACK(total-size, 1, 0));
 
-    return bp;
 
 }
 
@@ -227,9 +253,13 @@ void mm_free(void *bp)
     if(bp == NULL){ // NULL이 들어오는 경우 안 터지게 방지
         return;
     }
-    size_t size = GET_SIZE(HDRP(bp)); // 원래 ptr이었는데 bp로 통일 
-    PUT(HDRP(bp), PACK(size, 0));
-    PUT(FTRP(bp), PACK(size, 0));
+
+    size_t size = GET_SIZE(HDRP(bp));
+    size_t prev = GET_P_INUSE(HDRP(bp));
+
+    PUT(HDRP(bp),  PACK(size, prev, 0));
+    PUT(FTRP(bp),  PACK(size, prev, 0));
+    change_prev(NEXT_BLKP(bp), 0);
 
     coalesce(bp);
 
@@ -239,7 +269,7 @@ void mm_free(void *bp)
 static void *coalesce(void *bp)
 {
     size_t size = GET_SIZE(HDRP(bp));
-    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
+    size_t prev_alloc = GET_P_INUSE(HDRP(bp));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
 
     if(prev_alloc && next_alloc == 1){
@@ -252,8 +282,8 @@ static void *coalesce(void *bp)
         }
 
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        PUT(HDRP(bp), PACK(size, 0));
-        PUT(FTRP(bp), PACK(size, 0)); // 위에서 header size를 바꿔서 NEXT_BLKP -> FTRP로 접근해야한다 
+        PUT(HDRP(bp), PACK(size, prev_alloc, 0));
+        PUT(FTRP(bp), PACK(size,prev_alloc, 0)); // 위에서 header size를 바꿔서 NEXT_BLKP -> FTRP로 접근해야한다 
 
 
         return bp;
@@ -264,9 +294,10 @@ static void *coalesce(void *bp)
             current = PREV_BLKP(bp);
         }
 
+        size_t prev = GET_P_INUSE(HDRP(PREV_BLKP(bp)));
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        PUT(FTRP(bp), PACK(size, 0));
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, prev, 0));
+        PUT(FTRP(bp), PACK(size, prev, 0));
 
 
     }
@@ -277,8 +308,10 @@ static void *coalesce(void *bp)
         }
 
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0)); // 여기는 현재 header size를 안 건드려서 next_blkp 접근 가능 
+        size_t prev = GET_P_INUSE(HDRP(PREV_BLKP(bp)));
+
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, prev, 0));
+        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, prev, 0)); // 여기는 현재 header size를 안 건드려서 next_blkp 접근 가능 
 
     }
 
@@ -310,7 +343,7 @@ void *mm_realloc(void *bp, size_t size)
         return newbp; // bp를 NULL로 넣은 경우엔 일반 malloc과 같음 
     }
 
-    copySize = GET_SIZE(HDRP(oldbp)) - DSIZE;
+    copySize = GET_SIZE(HDRP(oldbp)) - WSIZE; // footer가 없어져서 DSIZE -> WSIZE로 바꿈 
     if (size < copySize)
         copySize = size;
 
