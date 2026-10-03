@@ -68,6 +68,9 @@ static void place(void *bp, size_t asize);
 static void *split_block(void *bp, size_t size);
 
 static char *heap_listp; // 전역변수로 포인터 선언 
+static char* current; // next_fit 를 위한 전연변수 
+
+
 /*
  * mm_init - initialize the malloc package.
  */
@@ -83,6 +86,7 @@ int mm_init(void)
     PUT(heap_listp + 2 * WSIZE, PACK(DSIZE, 1)); // Prologue footer
     PUT(heap_listp + 3 * WSIZE, PACK(0, 1)); //  Epilogue header 
     heap_listp += 4 *WSIZE; // 첫 청크부터 시작하는 작은 최적화(처음에는 heap의 끝을 가르킴 )
+    current = heap_listp - 2 * WSIZE; // next_fit 변수 초기화
 
     if(extend_heap(CHUNKSIZE / WSIZE) == NULL){ // heap 공간 확보 
         return -1;
@@ -153,25 +157,35 @@ void *mm_malloc(size_t size)
 }
 
 
-//first fit 방식 
+
+
 static void *find_fit(size_t asize)
 {
-    char * current = heap_listp;
+    int flag = 0;
+    current = NEXT_BLKP(current);
 
-    if(GET_SIZE(HDRP(current)) == 0){ // 바로  Epilogue면 반환 
-        return NULL;
+    if(GET_SIZE(HDRP(current)) == 0){ // 바로  Epilogue면 다음바퀴로
+        current = heap_listp - DSIZE;
     }
 
     char * next;
+
     while(1){
         if(GET_SIZE(HDRP(current)) >= asize && !GET_ALLOC(HDRP(current))){
-            return current;
+            return current; // 찾은 경우
         }
 
         next = NEXT_BLKP(current);
 
-        if(GET_SIZE(HDRP(next)) == 0){ // 프롤로그를 만나면 return
-            return NULL;
+        if(GET_SIZE(HDRP(next)) == 0){ // 프롤로그를 만나면 다음바퀴로 감 
+            current = heap_listp - DSIZE;
+            if(flag){
+                return NULL;
+            }
+            else{
+                flag = 1;
+            }
+            continue;
         }
         current = next; // 아니면 다음 청크로
     }
@@ -233,28 +247,43 @@ static void *coalesce(void *bp)
     }
 
     else if(prev_alloc && !next_alloc){ // 뒤가 free일 때
+        if(NEXT_BLKP(bp) == current){
+            current = bp;
+        }
+
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0)); // 위에서 header size를 바꿔서 NEXT_BLKP -> FTRP로 접근해야한다 
+
 
         return bp;
     }
 
     else if(!prev_alloc && next_alloc){ // 앞 청크가 free 일 때 
+        if (bp == current){
+            current = PREV_BLKP(bp);
+        }
+
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
 
-        return PREV_BLKP(bp);
+
     }
 
     else{
+        if (bp == current || NEXT_BLKP(bp) == current){
+            current = PREV_BLKP(bp);
+        }
+
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0)); // 여기는 현재 header size를 안 건드려서 next_blkp 접근 가능 
 
-        return PREV_BLKP(bp);
     }
+
+
+    return PREV_BLKP(bp);
 }
 
 /*
