@@ -54,7 +54,7 @@ team_t team = {
 #define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
 
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)))
-#define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE((char *)bp - DSIZE))
+#define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE((char *)(bp) - DSIZE))
 
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7) // 정렬의 배수로 올림 (~0x7로 지움 구현)
@@ -65,6 +65,7 @@ static void *extend_heap(size_t words); // 함수 프로토타입 선언
 static void *coalesce(void *bp);
 static void *find_fit(size_t asize);
 static void place(void *bp, size_t asize);
+static void *split_block(void *bp, size_t size);
 
 static char *heap_listp; // 전역변수로 포인터 선언 
 /*
@@ -81,11 +82,13 @@ int mm_init(void)
     PUT(heap_listp + WSIZE, PACK(DSIZE, 1)); // Prologue header
     PUT(heap_listp + 2 * WSIZE, PACK(DSIZE, 1)); // Prologue footer
     PUT(heap_listp + 3 * WSIZE, PACK(0, 1)); //  Epilogue header 
-    heap_listp += 2 *WSIZE; // heaplist를 prologue header 뒤로 옮김 
+    heap_listp += 4 *WSIZE; // 첫 청크부터 시작하는 작은 최적화(처음에는 heap의 끝을 가르킴 )
 
     if(extend_heap(CHUNKSIZE / WSIZE) == NULL){ // heap 공간 확보 
         return -1;
     }
+
+
 
     return 0; // 정상종료
 
@@ -132,6 +135,7 @@ void *mm_malloc(size_t size)
     }
 
     if((bp = find_fit(size)) != NULL){
+        bp = split_block(bp, size);
         place(bp, size);
         return bp;
     }
@@ -140,9 +144,64 @@ void *mm_malloc(size_t size)
         if((bp = extend_heap(extend / WSIZE)) == NULL){ // 메모리 없으면 extend 
             return NULL;
         }
+
+        bp = split_block(bp, size);
         place(bp, size);
         return bp;
     }
+
+}
+
+
+//first fit 방식 
+static void *find_fit(size_t asize)
+{
+    char * current = heap_listp;
+
+    if(GET_SIZE(HDRP(current)) == 0){ // 바로  Epilogue면 반환 
+        return NULL;
+    }
+
+    char * next;
+    while(1){
+        if(GET_SIZE(HDRP(current)) >= asize && !GET_ALLOC(HDRP(current))){
+            return current;
+        }
+
+        next = NEXT_BLKP(current);
+
+        if(GET_SIZE(HDRP(next)) == 0){ // 프롤로그를 만나면 return
+            return NULL;
+        }
+        current = next; // 아니면 다음 청크로
+    }
+}
+
+
+static void place(void *bp, size_t asize)
+{
+    if(GET_SIZE(HDRP(bp)) > asize){
+        asize = GET_SIZE(HDRP(bp));
+    }
+    PUT(HDRP(bp), PACK(asize, 1));
+    PUT(FTRP(bp), PACK(asize, 1));
+
+}
+
+static void *split_block(void *bp, size_t size){
+
+    size_t total = GET_SIZE(HDRP(bp));
+
+    if(total - size < 2 * DSIZE){
+        return bp; // 분할 햇다고 생각햇을 때 total-size 가 16바이트보다 작으면 그냥 return -> 이 조건에서 total == size인 경우도 잡아짐 
+    }
+
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(total-size, 0));
+    PUT(FTRP(NEXT_BLKP(bp)), PACK(total-size, 0));
+
+    return bp;
 
 }
 
@@ -151,6 +210,9 @@ void *mm_malloc(size_t size)
  */
 void mm_free(void *bp)
 {
+    if(bp == NULL){ // NULL이 들어오는 경우 안 터지게 방지
+        return;
+    }
     size_t size = GET_SIZE(HDRP(bp)); // 원래 ptr이었는데 bp로 통일 
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
@@ -159,6 +221,7 @@ void mm_free(void *bp)
 
 }
 
+//병합 함수 
 static void *coalesce(void *bp)
 {
     size_t size = GET_SIZE(HDRP(bp));
@@ -197,19 +260,33 @@ static void *coalesce(void *bp)
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
-void *mm_realloc(void *ptr, size_t size)
+void *mm_realloc(void *bp, size_t size)
 {
-    void *oldptr = ptr;
-    void *newptr;
+    if(size == 0){
+        mm_free(bp); // size를 0으로 realloc하면 free와 같이 움직여야함 
+        return NULL;
+    }
+
+
+    void *oldbp = bp;
+    void *newbp;
     size_t copySize;
 
-    newptr = mm_malloc(size);
-    if (newptr == NULL)
+    newbp = mm_malloc(size);
+
+    if (newbp == NULL)
         return NULL;
-    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
+
+    if(bp == NULL){
+        return newbp; // bp를 NULL로 넣은 경우엔 일반 malloc과 같음 
+    }
+
+    copySize = GET_SIZE(HDRP(oldbp)) - DSIZE;
     if (size < copySize)
         copySize = size;
-    memcpy(newptr, oldptr, copySize);
-    mm_free(oldptr);
-    return newptr;
+
+    memcpy(newbp, oldbp, copySize);
+    mm_free(oldbp);
+
+    return newbp;
 }
