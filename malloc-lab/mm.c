@@ -81,6 +81,7 @@ static void place(void *bp, size_t asize);
 static void disconnect(void *bp); //malloc에 사용 
 static void insert(void *bp); // free에 사용 
 int expand_block(void *bp, size_t size); //realloc에 사용 
+static size_t up_pow(size_t size); // 2의 거듭제곱만큼 할당 
 
 static char *heap_listp; // 전역변수로 포인터 선언 
 static char* head; // freelist를 위한 전역변수 head는 그냥 포인터로 관리하면 된다. 
@@ -135,6 +136,15 @@ static void *extend_heap(size_t words)
 
 }
 
+static size_t up_pow(size_t size){
+    if(size <= 64 || size >= 1024){
+        return size;
+    }
+
+    int top = 63 - __builtin_clzl(size - 1); // 128 일 떄도 128로 올려버리면 안 되니까 -1하고 계산 
+    return (size_t )1 << (top + 1);
+}
+
 /*
  * mm_malloc - Allocate a block by incrementing the brk pointer.
  *     Always allocate a block whose size is a multiple of the alignment.
@@ -148,7 +158,7 @@ void *mm_malloc(size_t size)
         return NULL;
     }
 
-    size = ADJUST_SIZE(size);
+    size = ADJUST_SIZE(up_pow(size)); //일단 malloc에만 적용 
 
     if((bp = find_fit(size)) != NULL){
         place(bp, size);
@@ -176,8 +186,15 @@ static void *find_fit(size_t asize)
 
     char * current = head;
     char * best =  NULL; // 이건 head가 asize에 안 맞을 수도 있으니까 처음엔 NULL로 설정해야함 
+    char * top = NULL;
 
-    for(current; current != NULL; current = NEXT_FREE(current)){
+    for(; current != NULL; current = NEXT_FREE(current)){
+        if(GET_SIZE(HDRP(NEXT_BLKP(current))) == 0){ //top에 붙은 청크면 후순위로 미룸 
+            if(GET_SIZE(HDRP(current)) >= asize){
+                top = current;
+            }
+            continue;
+        }
         if(GET_SIZE(HDRP(current)) == asize){
             return current;
         }
@@ -193,7 +210,9 @@ static void *find_fit(size_t asize)
         }
     }
 
-
+    if(!best && top){
+        return top;
+    }
     return best;
 }
 
