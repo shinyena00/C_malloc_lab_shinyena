@@ -167,6 +167,11 @@ void *mm_malloc(size_t size)
     }
     else{
         extend = MAX(size, CHUNKSIZE);
+        char * brk = (char *)mem_heap_hi() + 1;
+        char *top = brk - DSIZE;
+        if(!GET_ALLOC(top)){
+            extend -= GET_SIZE(top);
+        }
         if((bp = extend_heap(extend / WSIZE)) == NULL){ // 메모리 없으면 extend 
             return NULL;
         }
@@ -326,7 +331,7 @@ static void *coalesce(void *bp)
     return PREV_BLKP(bp);
 }
 
-
+//  realloc에서 expand 할 때 
 int expand_block(void *bp, size_t size){
     char *next = HDRP(NEXT_BLKP(bp));
     size_t asize = GET_SIZE(HDRP(bp));
@@ -339,11 +344,10 @@ int expand_block(void *bp, size_t size){
         return 1;
     }
     else if(GET_SIZE(next) == 0){ // 뒤가 epiloque면 heap을 늘려서 돌려주기 
-        size_t extend = MAX(size - asize, CHUNKSIZE);
+        size_t extend = MAX(size - asize, CHUNKSIZE); // 여기서는 어차피 bp가 에필로그 바로 앞이엿다는 거라서 앞에 거랑 합친 거를 extend해줄 필요가 없음 
         if((extend_heap(extend / WSIZE)) == NULL){ // 메모리 없으면 extend 
             return 0;
         }
-
         expand_block(bp, size); // 앞이랑 합치기
         place(bp, size); // 분할
         return 1;
