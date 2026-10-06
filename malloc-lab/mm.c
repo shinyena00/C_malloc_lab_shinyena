@@ -9,6 +9,7 @@
  * NOTE TO STUDENTS: Replace this header comment with your own header
  * comment that gives a high level description of your solution.
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -47,11 +48,22 @@ team_t team = {
 #define GET(p) (*(unsigned int *)(p)) // int로 읽기 
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
 
+#define PREV_VAL(p)  (*(unsigned int *)(p)) // 똑같은 건데 가독성을 위해서 추가함 
+#define NEXT_VAL(p)  (*(unsigned int *)((char *)(p)+ WSIZE))
+
 #define GET_SIZE(p) (GET(p) & ~0x7)
 #define GET_ALLOC(p) (GET(p) & 0x1)
 
 #define HDRP(bp) ((char *)(bp) - WSIZE)
 #define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
+#define NEXTP(bp) ((char *)(bp) + WSIZE) // bp 블록 안의 succ
+#define PREVP(bp) ((char *)(bp))
+
+#define offtoptr(bp, off) ((off) ? (heap_base) + (off) : NULL) // heap listp 에서 offset을 더하는 방식 채택 
+#define ptrtooff(bp) ((bp) != NULL ? (unsigned int)((char *)(bp) - heap_base) : 0)
+
+#define NEXT_FREE(bp) (offtoptr((bp), NEXT_VAL(bp))) // 명시적 가용 리스트 이동 하는 거 , 진짜 이동 
+#define PREV_FREE(bp) (offtoptr((bp), PREV_VAL(bp)))
 
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE((char *)(bp) - DSIZE))
@@ -59,16 +71,18 @@ team_t team = {
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7) // 정렬의 배수로 올림 (~0x7로 지움 구현)
 
-#define SIZE_T_SIZE (ALIGN(sizeof(size_t))) // size_t를 올림 -> 여기서는 8바이트 즉, 푸터와 헤더 8바이트를 더해서 배수 구함
 
 static void *extend_heap(size_t words); // 함수 프로토타입 선언 
 static void *coalesce(void *bp);
 static void *find_fit(size_t asize);
 static void place(void *bp, size_t asize);
-static void *split_block(void *bp, size_t size);
+static void disconnect(void *bp); //malloc에 사용 
+static void insert(void *bp); // free에 사용 
 
 static char *heap_listp; // 전역변수로 포인터 선언 
 static char* current; // next_fit 를 위한 전연변수 
+static char* head; // freelist를 위한 전역변수 head는 그냥 포인터로 관리하면 된다. 
+static char* heap_base; 
 
 
 /*
@@ -81,12 +95,14 @@ int mm_init(void)
         return -1;
     }
 
-    PUT(heap_listp, 0);
+    PUT(heap_listp, 0); // null 문자가 가르키는 곳 
     PUT(heap_listp + WSIZE, PACK(DSIZE, 1)); // Prologue header
     PUT(heap_listp + 2 * WSIZE, PACK(DSIZE, 1)); // Prologue footer
     PUT(heap_listp + 3 * WSIZE, PACK(0, 1)); //  Epilogue header 
+    heap_base = heap_listp; // null 이 0과 같아서 heap_base를 heap_listp로 초기화해야한다. 
     heap_listp += 4 *WSIZE; // 첫 청크부터 시작하는 작은 최적화(처음에는 heap의 끝을 가르킴 )
-    current = heap_listp - 2 * WSIZE; // next_fit 변수 초기화
+    current = NULL; // next_fit 변수를 head를 가르키게 초기화 
+    head = NULL; // free list 초기화 
 
     if(extend_heap(CHUNKSIZE / WSIZE) == NULL){ // heap 공간 확보 
         return -1;
@@ -111,7 +127,7 @@ static void *extend_heap(size_t words)
     }
 
     PUT((char *)bp - WSIZE, PACK(size, 0)); // new chunk header
-    PUT(FTRP(bp), PACK(size, 0));     // newe chunk footer
+    PUT(FTRP(bp), PACK(size, 0));     // new chunk footer
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0,1)); // epilogue
 
     return coalesce(bp);
@@ -131,15 +147,14 @@ void *mm_malloc(size_t size)
         return NULL;
     }
 
-    if(size <= DSIZE){
-        size = 2 * DSIZE;
+    if(size <= DSIZE){ // 이제는 할당 단위에서는 prev, next 생각 안 해 도 됨 
+        size = 2 * DSIZE;  
     }
     else{
-        size = ALIGN(size + SIZE_T_SIZE); // 올림 
+        size = ALIGN(size +  DSIZE); // 8 바이트 올림 
     }
 
     if((bp = find_fit(size)) != NULL){
-        bp = split_block(bp, size);
         place(bp, size);
         return bp;
     }
@@ -149,7 +164,6 @@ void *mm_malloc(size_t size)
             return NULL;
         }
 
-        bp = split_block(bp, size);
         place(bp, size);
         return bp;
     }
@@ -161,12 +175,18 @@ void *mm_malloc(size_t size)
 
 static void *find_fit(size_t asize)
 {
-    int flag = 0;
-    current = NEXT_BLKP(current);
 
-    if(GET_SIZE(HDRP(current)) == 0){ // 바로  Epilogue면 다음바퀴로
-        current = heap_listp - DSIZE;
+
+    if(current == NULL){ // 바로 끝이면 다음바퀴로
+        current = head; // head로 감 
     }
+    char * end = current;
+
+
+    if(current == NULL){ // 두번쨰도 null이면 리턴 
+        return NULL;
+    }
+
 
     char * next;
 
@@ -175,47 +195,67 @@ static void *find_fit(size_t asize)
             return current; // 찾은 경우
         }
 
-        next = NEXT_BLKP(current);
+        next = NEXT_FREE(current);
 
-        if(GET_SIZE(HDRP(next)) == 0){ // 프롤로그를 만나면 다음바퀴로 감 
-            current = heap_listp - DSIZE;
-            if(flag){
-                return NULL;
-            }
-            else{
-                flag = 1;
-            }
-            continue;
+        if(next == NULL){ // 프롤로그를 만나면 다음바퀴로 감 
+            next = head;
         }
+
+        if (next == end){ // 한 바퀴 돌아서 시작한 곳을 만나면 null 반환
+            return NULL;
+        }
+
         current = next; // 아니면 다음 청크로
+        
     }
 }
 
+static void disconnect(void *bp){
 
-static void place(void *bp, size_t asize)
-{
-    if(GET_SIZE(HDRP(bp)) > asize){
-        asize = GET_SIZE(HDRP(bp));
+    if (bp == current) current =  NEXT_FREE(bp);
+
+    if(PREV_VAL(bp) != 0){
+        PUT(NEXTP(PREV_FREE(bp)), NEXT_VAL(bp));
     }
-    PUT(HDRP(bp), PACK(asize, 1));
-    PUT(FTRP(bp), PACK(asize, 1));
+    else{
+        head = NEXT_FREE(bp);
+    }
 
+    if(NEXT_VAL(bp) != 0){
+        PUT(PREVP(NEXT_FREE(bp)), PREV_VAL(bp));
+    }
+}
+static void insert(void *bp){
+    PUT(PREVP(bp), 0); // 연결을 size_t offset으로 관리하기 때문에 null이 아닌 0으로 취급해줘야한다 
+    PUT(NEXTP(bp), ptrtooff(head));
+    if(head != NULL){
+        PUT(PREVP(head), ptrtooff(bp)); // head가 null이 아닐 때로 뒤도 앞을 가리키게 
+    }
+    head = bp;
 }
 
-static void *split_block(void *bp, size_t size){
+static void place(void *bp, size_t size){
+
 
     size_t total = GET_SIZE(HDRP(bp));
 
-    if(total - size < 2 * DSIZE){
-        return bp; // 분할 햇다고 생각햇을 때 total-size 가 16바이트보다 작으면 그냥 return -> 이 조건에서 total == size인 경우도 잡아짐 
+    if(total - size < 3 * DSIZE){
+        PUT(HDRP(bp), PACK(total, 1));
+        PUT(FTRP(bp), PACK(total, 1));
+        disconnect(bp);
+        return; // 분할 햇다고 생각햇을 때 total-size 가 12바이트보다 작으면 그냥 return -> 이 조건에서 total == size인 경우도 잡아짐 
     }
 
-    PUT(HDRP(bp), PACK(size, 0));
-    PUT(FTRP(bp), PACK(size, 0));
+    disconnect(bp);
+
+    PUT(HDRP(bp), PACK(size, 1));
+    PUT(FTRP(bp), PACK(size, 1));
     PUT(HDRP(NEXT_BLKP(bp)), PACK(total-size, 0));
     PUT(FTRP(NEXT_BLKP(bp)), PACK(total-size, 0));
 
-    return bp;
+    insert(NEXT_BLKP(bp));
+
+
 
 }
 
@@ -228,6 +268,7 @@ void mm_free(void *bp)
         return;
     }
     size_t size = GET_SIZE(HDRP(bp)); // 원래 ptr이었는데 bp로 통일 
+
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
 
@@ -243,46 +284,43 @@ static void *coalesce(void *bp)
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
 
     if(prev_alloc && next_alloc == 1){
+        insert(bp);
         return bp;
     }
 
     else if(prev_alloc && !next_alloc){ // 뒤가 free일 때
-        if(NEXT_BLKP(bp) == current){
-            current = bp;
-        }
 
+        disconnect(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(bp), PACK(size, 0));
-        PUT(FTRP(bp), PACK(size, 0)); // 위에서 header size를 바꿔서 NEXT_BLKP -> FTRP로 접근해야한다 
+        PUT(FTRP(bp), PACK(size, 0)); // 위에서 header size를 바꿔서 NEXT_BLKP -> FTRP로 접근해야한다
+        insert(bp);
 
 
         return bp;
     }
 
     else if(!prev_alloc && next_alloc){ // 앞 청크가 free 일 때 
-        if (bp == current){
-            current = PREV_BLKP(bp);
-        }
+
+        disconnect(PREV_BLKP(bp));
 
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
 
-
     }
 
     else{
-        if (bp == current || NEXT_BLKP(bp) == current){
-            current = PREV_BLKP(bp);
-        }
 
+        disconnect(PREV_BLKP(bp));
+        disconnect(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0)); // 여기는 현재 header size를 안 건드려서 next_blkp 접근 가능 
 
     }
 
-
+    insert(PREV_BLKP(bp));
     return PREV_BLKP(bp);
 }
 
