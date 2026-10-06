@@ -68,8 +68,10 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE((char *)(bp) - DSIZE))
 
+
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7) // 정렬의 배수로 올림 (~0x7로 지움 구현)
+#define ADJUST_SIZE(size) (((size) <= DSIZE) ? 2 * DSIZE : ALIGN((size) + DSIZE))
 
 
 static void *extend_heap(size_t words); // 함수 프로토타입 선언 
@@ -78,9 +80,9 @@ static void *find_fit(size_t asize);
 static void place(void *bp, size_t asize);
 static void disconnect(void *bp); //malloc에 사용 
 static void insert(void *bp); // free에 사용 
+int expand_block(void *bp, size_t size); //realloc에 사용 
 
 static char *heap_listp; // 전역변수로 포인터 선언 
-static char* current; // next_fit 를 위한 전연변수 
 static char* head; // freelist를 위한 전역변수 head는 그냥 포인터로 관리하면 된다. 
 static char* heap_base; 
 
@@ -101,7 +103,6 @@ int mm_init(void)
     PUT(heap_listp + 3 * WSIZE, PACK(0, 1)); //  Epilogue header 
     heap_base = heap_listp; // null 이 0과 같아서 heap_base를 heap_listp로 초기화해야한다. 
     heap_listp += 4 *WSIZE; // 첫 청크부터 시작하는 작은 최적화(처음에는 heap의 끝을 가르킴 )
-    current = NULL; // next_fit 변수를 head를 가르키게 초기화 
     head = NULL; // free list 초기화 
 
     if(extend_heap(CHUNKSIZE / WSIZE) == NULL){ // heap 공간 확보 
@@ -147,15 +148,11 @@ void *mm_malloc(size_t size)
         return NULL;
     }
 
-    if(size <= DSIZE){ // 이제는 할당 단위에서는 prev, next 생각 안 해 도 됨 
-        size = 2 * DSIZE;  
-    }
-    else{
-        size = ALIGN(size +  DSIZE); // 8 바이트 올림 
-    }
+    size = ADJUST_SIZE(size);
 
     if((bp = find_fit(size)) != NULL){
         place(bp, size);
+        disconnect(bp);
         return bp;
     }
     else{
@@ -165,6 +162,7 @@ void *mm_malloc(size_t size)
         }
 
         place(bp, size);
+        disconnect(bp);
         return bp;
     }
 
@@ -176,43 +174,31 @@ void *mm_malloc(size_t size)
 static void *find_fit(size_t asize)
 {
 
+    char * current = head;
+    char * best =  NULL; // 이건 head가 asize에 안 맞을 수도 있으니까 처음엔 NULL로 설정해야함 
 
-    if(current == NULL){ // 바로 끝이면 다음바퀴로
-        current = head; // head로 감 
-    }
-    char * end = current;
-
-
-    if(current == NULL){ // 두번쨰도 null이면 리턴 
-        return NULL;
-    }
-
-
-    char * next;
-
-    while(1){
-        if(GET_SIZE(HDRP(current)) >= asize && !GET_ALLOC(HDRP(current))){
-            return current; // 찾은 경우
+    for(current; current != NULL; current = NEXT_FREE(current)){
+        if(GET_SIZE(HDRP(current)) == asize){
+            return current;
         }
 
-        next = NEXT_FREE(current);
 
-        if(next == NULL){ // 프롤로그를 만나면 다음바퀴로 감 
-            next = head;
+        if(GET_SIZE(HDRP(current)) > asize){
+            if(!best){
+                best = current;
+            }
+            else if(GET_SIZE(HDRP(best)) > GET_SIZE(HDRP(current))){
+                best = current;
+            }
         }
-
-        if (next == end){ // 한 바퀴 돌아서 시작한 곳을 만나면 null 반환
-            return NULL;
-        }
-
-        current = next; // 아니면 다음 청크로
-        
     }
+
+
+    return best;
 }
 
 static void disconnect(void *bp){
 
-    if (bp == current) current =  NEXT_FREE(bp);
 
     if(PREV_VAL(bp) != 0){
         PUT(NEXTP(PREV_FREE(bp)), NEXT_VAL(bp));
@@ -242,11 +228,8 @@ static void place(void *bp, size_t size){
     if(total - size < 3 * DSIZE){
         PUT(HDRP(bp), PACK(total, 1));
         PUT(FTRP(bp), PACK(total, 1));
-        disconnect(bp);
         return; // 분할 햇다고 생각햇을 때 total-size 가 12바이트보다 작으면 그냥 return -> 이 조건에서 total == size인 경우도 잡아짐 
     }
-
-    disconnect(bp);
 
     PUT(HDRP(bp), PACK(size, 1));
     PUT(FTRP(bp), PACK(size, 1));
@@ -324,6 +307,31 @@ static void *coalesce(void *bp)
     return PREV_BLKP(bp);
 }
 
+
+int expand_block(void *bp, size_t size){
+    char *next = HDRP(NEXT_BLKP(bp));
+    size_t asize = GET_SIZE(HDRP(bp));
+
+    if(GET_ALLOC(next) == 0 && GET_SIZE(next) + asize >= size){
+        disconnect(NEXT_BLKP(bp));
+        asize += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        PUT(HDRP(bp), PACK(asize, 1));
+        PUT(FTRP(bp), PACK(asize, 1));
+        return 1;
+    }
+    else if(GET_SIZE(next) == 0){ // 뒤가 epiloque면 heap을 늘려서 돌려주기 
+        size_t extend = MAX(size - asize, CHUNKSIZE);
+        if((extend_heap(extend / WSIZE)) == NULL){ // 메모리 없으면 extend 
+            return 0;
+        }
+
+        expand_block(bp, size); // 앞이랑 합치기
+        place(bp, size); // 분할
+        return 1;
+    }
+
+    return 0;
+}
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
@@ -332,6 +340,20 @@ void *mm_realloc(void *bp, size_t size)
     if(size == 0){
         mm_free(bp); // size를 0으로 realloc하면 free와 같이 움직여야함 
         return NULL;
+    }
+
+
+    size_t asize = ADJUST_SIZE(size);
+
+    if(bp != NULL){
+        if(asize <= GET_SIZE(HDRP(bp))){ // 축소하는 경우 place로 분할까지 대체
+            place(bp, asize);
+            return bp;
+        }
+
+        if(expand_block(bp, asize)){
+            return bp;
+        }
     }
 
 
